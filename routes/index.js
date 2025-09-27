@@ -1,15 +1,15 @@
 #!/usr/bin/env node
 
-let express = require('express')
-let router = express.Router()
+import express from 'express'
 
-const staticRouter = require('./static')
-router.get('/',staticRouter)
+import staticRouter from './static.js'
+import managementRouter from './manage-api.js'
+import glossingRouter from './glossing-users.js'
 
-const managementRouter = require('./manage-api')
+const router = express.Router()
+
+router.get('/', staticRouter)
 router.use('/glossing-users/manage', managementRouter)
-
-const glossingRouter = require('./glossing-users')
 router.use('/glossing-users', glossingRouter)
 
-module.exports = router
+export default router

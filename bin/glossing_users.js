@@ -4,23 +4,25 @@
  * Module dependencies.
  */
 
-var app = require('../app')
-var debug = require('debug')('glossing_users:server')
-var http = require('http')
+import http from 'http'
+import debugModule from 'debug'
 
+import app from '../app.js'
+
+const debug = debugModule('glossing_users:server')
 
 /**
  * Get port from environment and store in Express.
  */
 
-var port = normalizePort(process.env.PORT || '3000')
+const port = normalizePort(process.env.PORT || '3000')
 app.set('port', port)
 
 /**
  * Create HTTP server.
  */
 
-var server = http.createServer(app)
+const server = http.createServer(app)
 
 /**
  * Listen on provided port, on all network interfaces.
@@ -32,7 +34,7 @@ server.on('listening', onListening)
 
 /**
  * Control the keep alive header
- */ 
+ */
 // Ensure all inactive connections are terminated by the ALB, by setting this a few seconds higher than the ALB idle timeout
 server.keepAliveTimeout = 8 * 1000 //8 seconds
 // Ensure the headersTimeout is set higher than the keepAliveTimeout due to this nodejs regression bug: https://github.com/nodejs/node/issues/27363
@@ -67,9 +69,7 @@ function onError(error) {
     throw error
   }
 
-  var bind = typeof port === 'string'
-    ? 'Pipe ' + port
-    : 'Port ' + port
+  const bind = typeof port === 'string' ? 'Pipe ' + port : 'Port ' + port
 
   // handle specific listen errors with friendly messages
   switch (error.code) {
@@ -91,10 +91,8 @@ function onError(error) {
  */
 
 function onListening() {
-  console.log("LISTENING ON "+port)
-  var addr = server.address()
-  var bind = typeof addr === 'string'
-    ? 'pipe ' + addr
-    : 'port ' + addr.port
+  console.log(`LISTENING ON ${port}`)
+  const addr = server.address()
+  const bind = typeof addr === 'string' ? 'pipe ' + addr : 'port ' + addr.port
   debug('Listening on ' + bind)
 }

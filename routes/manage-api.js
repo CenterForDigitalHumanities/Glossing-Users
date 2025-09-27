@@ -1,32 +1,64 @@
 #!/usr/bin/env node
 
-const ManagementClient = require('auth0').ManagementClient
-const AuthenticationClient = require('auth0').AuthenticationClient
-const express = require('express')
+import express from 'express'
+import { ManagementClient, AuthenticationClient } from 'auth0'
+
 const router = express.Router()
-const got = require('got')
 
-const ROLES = [
-  process.env.ROLE_MANAGER_ID,
-  process.env.ROLE_CONTRIBUTOR_ID,
-  process.env.ROLE_PUBLIC_ID
-].map(str => str.split(' ')[0])
+const ROLE_CONFIG = [
+  { name: 'manager', envKey: 'ROLE_MANAGER_ID' },
+  { name: 'contributor', envKey: 'ROLE_CONTRIBUTOR_ID' },
+  { name: 'public', envKey: 'ROLE_PUBLIC_ID' },
+]
 
-let manager = new ManagementClient({
+const resolvedRoles = ROLE_CONFIG.map(({ name, envKey }) => ({
+  name,
+  id: String(process.env[envKey] ?? '').split(' ')[0],
+})).filter(({ id }) => Boolean(id))
+
+const roleIds = resolvedRoles.map(({ id }) => id)
+
+const resolveRoleIdByName = (roleName) => {
+  const normalized = String(roleName ?? '').toLowerCase()
+  return resolvedRoles.find(({ name }) => name === normalized)?.id
+}
+
+const extractUsers = (group) => {
+  if (!group) {
+    return []
+  }
+
+  if (Array.isArray(group)) {
+    return group
+  }
+
+  if (Array.isArray(group.data)) {
+    return group.data
+  }
+
+  if (Array.isArray(group.users)) {
+    return group.users
+  }
+
+  return []
+}
+
+const managementClient = new ManagementClient({
   domain: process.env.DOMAIN,
   clientId: process.env.CLIENTID,
   clientSecret: process.env.CLIENT_SECRET,
-  scope: "create:users read:users read:user_idp_tokens update:users delete:users read:roles create:roles update:roles delete:roles"
+  scope:
+    'create:users read:users read:user_idp_tokens update:users delete:users read:roles create:roles update:roles delete:roles',
 })
 
-let authenticator = new AuthenticationClient({
+const authenticationClient = new AuthenticationClient({
   domain: process.env.DOMAIN,
-  clientId: process.env.CLIENTID
+  clientId: process.env.CLIENTID,
 })
 
 // /**
 //  * Let Glossing Apps Users update THEIR OWN profile info.
-//  * 
+//  *
 //  * Make sure the user making the request is the user to update.
 //  */
 // router.put('/updateProfileInfo', async function (req, res, next) {
@@ -81,42 +113,41 @@ let authenticator = new AuthenticationClient({
  * Get all the users from the Auth0 Tenant with app "glossing".
  */
 router.get('/getAllUsers', async function (req, res, next) {
-  let token = req.header("Authorization") ?? ""
-  token = token.replace("Bearer ", "")
-  try {
-    authenticator.getProfile(token)
-      .then(async (current_glossing_users) => {
-        if (!isAdmin(current_glossing_users)) {
-          res.status(403).send("You are not an admin")
-          return
-        }
+  const token = (req.header('Authorization') ?? '').replace('Bearer ', '').trim()
 
-        const fetchUsersInRoles = ROLES.map(id => manager.getUsersInRole({ id }))
-        return Promise.all(fetchUsersInRoles)
-          .then(userGroups => {
-            const roleNames = [
-              "manager",
-              "contributor",
-              "public"
-            ]
-            res.json(userGroups.map((group, index) => group.map(user => {
-              user.role = roleNames[index]
-              return user
-            })).flat())
-            return
-          })
-          .catch(err => {
-            console.error("Error getting users in back end")
-            res.status(500).send(err)
-          })
-      })
-      .catch(err => {
-        res.status(500)
-        next(err)
-      })
-  } catch (err) {
-    next(err)
+  if (!token) {
+    res.status(401).send('You must provide an access token in the Authorization header.')
     return
+  }
+
+  try {
+    const currentUser = await authenticationClient.getProfile(token)
+
+    if (!isAdmin(currentUser)) {
+      res.status(403).send('You are not an admin')
+      return
+    }
+
+    const userGroups = await Promise.all(
+      resolvedRoles.map(({ id }) => managementClient.roles.getUsers({ id }))
+    )
+
+    const usersWithRoles = userGroups.flatMap((group, index) => {
+      const roleDetails = resolvedRoles[index]
+      if (!roleDetails) {
+        return []
+      }
+
+      return extractUsers(group).map((user) => ({ ...user, role: roleDetails.name }))
+    })
+
+    res.json(usersWithRoles)
+  } catch (error) {
+    if (error?.status === 401 || error?.statusCode === 401) {
+      res.status(401).send('Unable to authenticate request')
+      return
+    }
+    next(error)
   }
 })
 
@@ -125,65 +156,56 @@ router.get('/getAllUsers', async function (req, res, next) {
  * This limits access token scope.
  * Other roles are removed.
  */
-router.post('/assignRole', async function (req, res, next) {
-  const token = (req.header("Authorization") ?? "")?.replace("Bearer ", "")
-  const { userid, role } = req.body
-  const roleID = process.env[`ROLE_${String(role).toUpperCase()}_ID`]
+router.post('/assignRole', async function (req, res) {
+  const token = (req.header('Authorization') ?? '').replace('Bearer ', '').trim()
+  const { userid, role } = req.body ?? {}
+  const normalizedRole = String(role ?? '').toLowerCase()
+  const targetRoleId = resolveRoleIdByName(normalizedRole)
 
-  // Guards
-  if (role === 'admin') {
-    res.status(501).send("No changing Admin roles here")
-  }
-  if (!userid || !roleID) {
-    res.status(406).send("Failed to provide data for assignment")
+  if (!token) {
+    res.status(401).send('Unable to authenticate request')
     return
   }
 
-  // Confirm Admin
-  authenticator.getProfile(token)
-    .then(user => {
-      if (!isAdmin(user)) {
-        res.status(403).send("Unable to authorize request by non-administrator")
-        return
-      }
-
-      manager.assignRolestoUser({ id: userid }, { roles: [roleID] })
-        .then(result => {
-          // Super odd. On success, the response is an empty string...
-          // unassign from other Glossing roles
-          const dataObj = { roles: ROLES.filter(justAdded => justAdded !== roleID) }
-
-          manager.removeRolesFromUser({ id: userid }, dataObj)
-            .then(resp2 => {
-              res.status(200).send(`${role[0].toUpperCase()}${role.substr(1)} role was successfully assigned to the user`)
-            })
-            .catch(err => {
-              res.status(500).send(err)
-            })
-        })
-        .catch(err => {
-          res.status(500).send(err)
-        })
-    })
-    .catch(err => {
-      res.status(401).send("Unable to authenticate request")
-    })
-})
-
-/**
- * The URL hash from the authorize endpoint looks like #access_token=...&scope=...&
- * Pass in the URL with the hash and the variable to grab.
- * The value for that variable is returned.
- */
-function getURLHash(variable, url) {
-  var query = url.substr(url.indexOf("#") + 1)
-  var vars = query.split("&")
-  for (var i = 0; i < vars.length; i++) {
-    var pair = vars[i].split("=")
-    if (pair[0] == variable) { return pair[1] }
+  if (normalizedRole === 'admin') {
+    res.status(501).send('No changing Admin roles here')
+    return
   }
-  return false
-}
+
+  if (!userid || !targetRoleId) {
+    res.status(406).send('Failed to provide data for assignment')
+    return
+  }
+
+  try {
+    const currentUser = await authenticationClient.getProfile(token)
+
+    if (!isAdmin(currentUser)) {
+      res.status(403).send('Unable to authorize request by non-administrator')
+      return
+    }
+
+    await managementClient.users.assignRoles({ id: userid }, { roles: [targetRoleId] })
+
+    const remainingRoleIds = roleIds.filter((existingRole) => existingRole !== targetRoleId)
+    if (remainingRoleIds.length) {
+      await managementClient.users.removeRoles({ id: userid }, { roles: remainingRoleIds })
+    }
+
+    const roleLabel = normalizedRole
+      ? `${normalizedRole.charAt(0).toUpperCase()}${normalizedRole.slice(1)}`
+      : 'Role'
+
+    res.status(200).send(`${roleLabel} role was successfully assigned to the user`)
+  } catch (error) {
+    if (error?.status === 401 || error?.statusCode === 401) {
+      res.status(401).send('Unable to authenticate request')
+      return
+    }
+
+    res.status(500).send(error)
+  }
+})
 
 /**
  *  Given a user profile, check if that user is a Glossing Apps admin.
@@ -193,17 +215,7 @@ function isAdmin(user) {
   if (user[process.env.GLOSSING_ROLES_CLAIM]) {
     roles = user[process.env.GLOSSING_ROLES_CLAIM].roles ?? { roles: [] }
   }
-  return roles.includes("glossing_user_admin")
+  return roles.includes('glossing_user_admin')
 }
 
-/**
- *  Given a user profile, check if that user belongs to a Glossing App.
- */
-function isGlossingUser(user) {
-  return (
-    user[process.env.GLOSSING_APP_CLAIM] &&
-    user[process.env.GLOSSING_APP_CLAIM] === "glossing"
-  )
-}
-
-module.exports = router
+export default router
