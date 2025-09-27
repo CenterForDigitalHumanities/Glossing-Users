@@ -1,9 +1,12 @@
-#!/usr/bin/env node
+import express from 'express'
+import path from 'path'
+import { fileURLToPath } from 'url'
 
-const express = require('express')
-const path = require('path')
+import managementRouter from './manage-api.js'
+
 const router = express.Router()
-const managementRouter = require('./manage-api.js')
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+
 // public also available at `/glossing-users` now
 router.use(express.static(path.join(__dirname, '../public')))
 
@@ -11,8 +14,8 @@ router.use(express.static(path.join(__dirname, '../public')))
 router.use('/manage', managementRouter)
 
 /* GET home page.  Redirect to login */
-router.get('/', function(req, res, next) {
+router.get('/', (_req, res) => {
   res.redirect(301, 'profile.html')
 })
 
-module.exports = router
+export default router
