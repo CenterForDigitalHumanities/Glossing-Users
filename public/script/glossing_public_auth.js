@@ -1,89 +1,172 @@
 /**
  * @module AuthButton Adds custom element for login/logout of Auth0, based on configuration below.
- * @author cubap
- *
- * @description This module includes a custom `<button is="auth-button">` element for authentication within
- * the Dunbar Public Library and Archive Project.
- * Notes:
- * - Include this module and a button[is='auth-button'] element to use.
- * - Add the `disabled` property on any page that should be available to the public, but knowing the user may be helpful.
- * - This can be made more generic by passing in the constants and parameterizing {app:'glossing'}.
+ * Modernized to use the Auth0 SPA SDK with refresh tokens and local storage caching.
  */
 
-import 'https://cdn.auth0.com/js/auth0/9.19.0/auth0.min.js'
+import createAuth0Client from 'https://cdn.jsdelivr.net/npm/@auth0/auth0-spa-js@2/dist/auth0-spa-js.production.esm.js'
 
 const AUDIENCE = 'https://cubap.auth0.com/api/v2/'
-const ISSUER_BASE_URL = 'cubap.auth0.com'
 const CLIENT_ID = '4TztHfVXjvs4H6ByCOXgwxtgA8IEQHsD'
 const DOMAIN = 'cubap.auth0.com'
+const AUTH_SCOPE =
+  'read:roles update:current_user_metadata name nickname picture email profile openid offline_access'
+const RETURN_KEY = 'glossing:returnTo'
 
-const webAuth = new auth0.WebAuth({
-  domain: DOMAIN,
-  clientID: CLIENT_ID,
-  audience: AUDIENCE,
-  scope:
-    'read:roles update:current_user_metadata name nickname picture email profile openid offline_access',
-  redirectUri: origin,
-  responseType: 'id_token token',
-  state: urlToBase64(location.href),
-})
+let pendingReturnTo = sessionStorage.getItem(RETURN_KEY) ?? null
 
-const logout = () => {
+const auth0ClientPromise = (async () => {
+  const client = await createAuth0Client({
+    domain: DOMAIN,
+    clientId: CLIENT_ID,
+    authorizationParams: {
+      audience: AUDIENCE,
+      scope: AUTH_SCOPE,
+      redirect_uri: window.location.origin + window.location.pathname,
+    },
+    cacheLocation: 'localstorage',
+    useRefreshTokens: true,
+  })
+
+  if (hasAuthRedirectParams()) {
+    try {
+      const { appState } = await client.handleRedirectCallback()
+      if (appState?.returnTo) {
+        pendingReturnTo = appState.returnTo
+        sessionStorage.setItem(RETURN_KEY, pendingReturnTo)
+      }
+    } catch (error) {
+      console.error('Auth0 redirect handling failed', error)
+    } finally {
+      clearAuthRedirectParams()
+    }
+  }
+
+  return client
+})()
+
+const getAuthClient = () => auth0ClientPromise
+
+function hasAuthRedirectParams() {
+  const params = new URLSearchParams(window.location.search)
+  return params.has('code') && params.has('state')
+}
+
+function clearAuthRedirectParams() {
+  const url = new URL(window.location.href)
+  url.searchParams.delete('code')
+  url.searchParams.delete('state')
+  url.searchParams.delete('error')
+  url.searchParams.delete('error_description')
+  const search = url.searchParams.toString()
+  const cleaned = `${url.origin}${url.pathname}${search ? `?${search}` : ''}${url.hash}`
+  window.history.replaceState({}, document.title, cleaned)
+}
+
+const consumeReturnTo = () => {
+  const stored = pendingReturnTo ?? sessionStorage.getItem(RETURN_KEY) ?? null
+  pendingReturnTo = null
+  if (stored) {
+    sessionStorage.removeItem(RETURN_KEY)
+  }
+  return stored
+}
+
+const login = async (options = {}) => {
+  const client = await getAuthClient()
+  const returnTo = options.returnTo ?? window.location.href
+  pendingReturnTo = returnTo
+  sessionStorage.setItem(RETURN_KEY, returnTo)
+  return client.loginWithRedirect({ appState: { returnTo } })
+}
+
+const logout = async (options = {}) => {
+  const client = await getAuthClient()
   localStorage.removeItem('userToken')
+  sessionStorage.removeItem(RETURN_KEY)
   delete window.GOG_USER
   document.querySelectorAll('[is="auth-creator"]').forEach((el) => el.connectedCallback())
-  webAuth.logout({ returnTo: origin })
+  await client.logout({ logoutParams: { returnTo: options.returnTo ?? window.location.origin } })
 }
-const login = (custom) =>
-  webAuth.authorize(Object.assign({ authParamsMap: { app: 'glossing' } }, custom))
 
-const getReferringPage = () => {
+async function refreshSession(button) {
+  const client = await getAuthClient()
+  let isAuthenticated
   try {
-    return b64toUrl(location.hash.split('state=')[1].split('&')[0])
-  } catch (err) {
-    return false
+    isAuthenticated = await client.isAuthenticated()
+  } catch (error) {
+    console.error('Auth0 authentication check failed', error)
+    isAuthenticated = false
+  }
+
+  if (!isAuthenticated) {
+    button.innerText = 'Login'
+    button.onclick = () => login()
+    button.removeAttribute('disabled')
+    if (!button.dataset.public) {
+      await login()
+    }
+    return
+  }
+
+  try {
+    const [user, claims] = await Promise.all([
+      client.getUser(),
+      client.getIdTokenClaims().catch(() => null),
+    ])
+    const accessToken = await client.getTokenSilently().catch(() => null)
+
+    const claimsPayload = claims ? { ...claims } : {}
+    if (claimsPayload.__raw) {
+      delete claimsPayload.__raw
+    }
+
+    window.GOG_USER = {
+      ...(user ?? {}),
+      ...(claimsPayload ?? {}),
+      authorization: accessToken,
+      idToken: claims?.__raw,
+    }
+
+    if (window.GOG_USER) {
+      localStorage.setItem('userToken', window.GOG_USER.idToken ?? '')
+    }
+
+    document.querySelectorAll('[is="auth-creator"]').forEach((el) => el.connectedCallback())
+
+    const nickname = window.GOG_USER?.nickname ?? window.GOG_USER?.name ?? 'User'
+    button.innerText = `Logout ${nickname}`
+    button.onclick = () => logout()
+    button.removeAttribute('disabled')
+
+    const loginEvent = new CustomEvent('glossing-authenticated', {
+      detail: {
+        ...window.GOG_USER,
+        returnTo: consumeReturnTo(),
+      },
+    })
+    button.dispatchEvent(loginEvent)
+  } catch (error) {
+    console.error('Auth0 session refresh failed', error)
+    await logout({ returnTo: window.location.origin })
   }
 }
 
 class AuthButton extends HTMLButtonElement {
   constructor() {
     super()
-    this.onclick = logout
     this.login = login
     this.logout = logout
+    this.dataset.public = this.hasAttribute('disabled') ? 'true' : ''
   }
 
   connectedCallback() {
-    webAuth.checkSession({}, (err, result) => {
-      if (err) {
-        if (this.getAttribute('disabled') !== null) {
-          return
-        }
-        login()
-      }
-      const ref = getReferringPage()
-      if (ref && ref !== location.href) {
-        location.href = ref
-      }
-      localStorage.setItem('userToken', result.idToken)
-      window.GOG_USER = result.idTokenPayload
-      window.GOG_USER.authorization = result.accessToken
-      document.querySelectorAll('[is="auth-creator"]').forEach((el) => el.connectedCallback())
-      this.innerText = `Logout ${GOG_USER.nickname}`
-      this.removeAttribute('disabled')
-      const loginEvent = new CustomEvent('glossing-authenticated', { detail: window.GOG_USER })
-      this.dispatchEvent(loginEvent)
-    })
+    refreshSession(this)
   }
 }
 
 customElements.define('auth-button', AuthButton, { extends: 'button' })
 
 class AuthCreator extends HTMLInputElement {
-  constructor() {
-    super()
-  }
-
   connectedCallback() {
     if (!window.GOG_USER) {
       return
@@ -94,21 +177,5 @@ class AuthCreator extends HTMLInputElement {
 
 customElements.define('auth-creator', AuthCreator, { extends: 'input' })
 
-/**
- * Follows the 'base64url' rules to decode a string.
- * @param {String} base64str from `state` parameter in the hash from Auth0
- * @returns referring URL
- */
-function b64toUrl(base64str) {
-  return window.atob(base64str.replace(/\-/g, '+').replace(/_/g, '/'))
-}
-/**
- * Follows the 'base64url' rules to encode a string.
- * @param {String} url from `window.location.href`
- * @returns encoded string to pass as `state` to Auth0
- */
-function urlToBase64(url) {
-  return window.btoa(url).replace(/\//g, '_').replace(/\+/g, '-').replace(/=+$/, '')
-}
-
-export default { AuthButton, AuthCreator }
+export { login, logout, getAuthClient }
+export default { AuthButton, AuthCreator, login, logout, getAuthClient }

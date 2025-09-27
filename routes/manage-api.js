@@ -1,5 +1,3 @@
-#!/usr/bin/env node
-
 import express from 'express'
 import { ManagementClient, AuthenticationClient } from 'auth0'
 
@@ -41,6 +39,107 @@ const extractUsers = (group) => {
   }
 
   return []
+}
+
+const DEFAULT_APP_METADATA_KEYS = ['appflag', 'apps', 'app', 'applications']
+const APP_IDENTIFIER = (process.env.GLOSSING_APP_IDENTIFIER ?? 'glossing').toLowerCase()
+const APP_CLAIM = process.env.GLOSSING_APP_CLAIM ?? ''
+const ROLE_PAGE_SIZE = Number.parseInt(process.env.GLOSSING_ROLE_PAGE_SIZE ?? '100', 10)
+const metadataKeys = (process.env.GLOSSING_APP_METADATA_KEYS ?? DEFAULT_APP_METADATA_KEYS.join(','))
+  .split(',')
+  .map((key) => key.trim())
+  .filter(Boolean)
+
+const requestedFields = (() => {
+  const fields = new Set(['user_id', 'email', 'name', 'nickname', 'picture', 'app_metadata'])
+  if (APP_CLAIM) {
+    fields.add(APP_CLAIM)
+  }
+  return Array.from(fields).join(',')
+})()
+
+const normalizeValue = (value) => {
+  if (typeof value === 'string') {
+    return value.trim().toLowerCase()
+  }
+  return undefined
+}
+
+const ensureArray = (value) => {
+  if (Array.isArray(value)) {
+    return value
+  }
+  if (value === undefined || value === null) {
+    return []
+  }
+  return [value]
+}
+
+const collectAppFlags = (user) => {
+  const metadata = user.app_metadata ?? {}
+  const collected = []
+
+  metadataKeys.forEach((key) => {
+    collected.push(...ensureArray(metadata[key]))
+  })
+
+  if (APP_CLAIM) {
+    collected.push(...ensureArray(user[APP_CLAIM]))
+  }
+
+  return collected
+}
+
+const isGlossingUser = (user) => {
+  if (!APP_IDENTIFIER) {
+    return true
+  }
+  return collectAppFlags(user).some((value) => normalizeValue(value) === APP_IDENTIFIER)
+}
+
+const resolvePageSize = () => {
+  if (Number.isNaN(ROLE_PAGE_SIZE) || ROLE_PAGE_SIZE <= 0) {
+    return 100
+  }
+  return Math.min(ROLE_PAGE_SIZE, 100)
+}
+
+async function listUsersForRole(roleId) {
+  const aggregated = []
+  const perPage = resolvePageSize()
+  let page = 0
+  let shouldContinue = true
+
+  while (shouldContinue) {
+    const response = await managementClient.roles.getUsers({
+      id: roleId,
+      page,
+      per_page: perPage,
+      include_totals: true,
+      include_fields: true,
+      fields: requestedFields,
+    })
+
+    const pageUsers = extractUsers(response)
+
+    if (!pageUsers.length) {
+      shouldContinue = false
+      continue
+    }
+
+    aggregated.push(...pageUsers)
+
+    const limit = typeof response?.limit === 'number' ? response.limit : perPage
+    const total = typeof response?.total === 'number' ? response.total : undefined
+
+    if ((total !== undefined && aggregated.length >= total) || pageUsers.length < limit) {
+      shouldContinue = false
+    } else {
+      page += 1
+    }
+  }
+
+  return aggregated.filter(isGlossingUser)
 }
 
 const managementClient = new ManagementClient({
@@ -128,18 +227,16 @@ router.get('/getAllUsers', async function (req, res, next) {
       return
     }
 
-    const userGroups = await Promise.all(
-      resolvedRoles.map(({ id }) => managementClient.roles.getUsers({ id }))
+    const roleUsers = await Promise.all(
+      resolvedRoles.map(async ({ id, name }) => ({
+        name,
+        users: await listUsersForRole(id),
+      }))
     )
 
-    const usersWithRoles = userGroups.flatMap((group, index) => {
-      const roleDetails = resolvedRoles[index]
-      if (!roleDetails) {
-        return []
-      }
-
-      return extractUsers(group).map((user) => ({ ...user, role: roleDetails.name }))
-    })
+    const usersWithRoles = roleUsers.flatMap(({ name, users }) =>
+      users.map((user) => ({ ...user, role: name }))
+    )
 
     res.json(usersWithRoles)
   } catch (error) {
